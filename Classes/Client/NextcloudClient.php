@@ -51,8 +51,6 @@ class NextcloudClient
     }
 
     /**
-     * Test the connection and return diagnostic info.
-     *
      * @return array{success: bool, status: int, message: string, webdavPath: string}
      */
     public function testConnection(): array
@@ -102,11 +100,6 @@ class NextcloudClient
     {
         $webdavPath = $this->buildWebdavPath($path);
 
-        $this->log('debug', 'PROPFIND {path} (depth {depth})', [
-            'path' => $webdavPath,
-            'depth' => $depth,
-        ]);
-
         $response = $this->client->request('PROPFIND', $webdavPath, [
             'headers' => [
                 'Depth' => (string)$depth,
@@ -126,14 +119,7 @@ class NextcloudClient
                 </d:propfind>',
         ]);
 
-        $status = $response->getStatusCode();
-
-        if ($status !== 207) {
-            $this->log('warning', 'PROPFIND {path} returned HTTP {status}', [
-                'path' => $webdavPath,
-                'status' => $status,
-                'body' => substr($response->getBody()->getContents(), 0, 500),
-            ]);
+        if ($response->getStatusCode() !== 207) {
             return [];
         }
 
@@ -153,11 +139,16 @@ class NextcloudClient
         return $response->getBody()->getContents();
     }
 
-    public function getStream(string $path): ResponseInterface
+    /**
+     * Download a file directly to a local path using streaming (memory-efficient).
+     */
+    public function downloadToFile(string $remotePath, string $localPath): bool
     {
-        return $this->client->request('GET', $this->buildWebdavPath($path), [
-            'stream' => true,
+        $response = $this->client->request('GET', $this->buildWebdavPath($remotePath), [
+            'sink' => $localPath,
         ]);
+
+        return $response->getStatusCode() === 200;
     }
 
     public function put(string $path, string $contents): bool
@@ -166,15 +157,7 @@ class NextcloudClient
             'body' => $contents,
         ]);
 
-        $status = $response->getStatusCode();
-        if (!in_array($status, [200, 201, 204], true)) {
-            $this->log('error', 'PUT {path} failed with HTTP {status}', [
-                'path' => $path,
-                'status' => $status,
-            ]);
-        }
-
-        return in_array($status, [200, 201, 204], true);
+        return in_array($response->getStatusCode(), [200, 201, 204], true);
     }
 
     public function putFile(string $path, string $localFilePath): bool
@@ -189,16 +172,7 @@ class NextcloudClient
                 'body' => $stream,
             ]);
 
-            $status = $response->getStatusCode();
-            if (!in_array($status, [200, 201, 204], true)) {
-                $this->log('error', 'PUT file {path} failed with HTTP {status}', [
-                    'path' => $path,
-                    'status' => $status,
-                    'body' => substr($response->getBody()->getContents(), 0, 500),
-                ]);
-            }
-
-            return in_array($status, [200, 201, 204], true);
+            return in_array($response->getStatusCode(), [200, 201, 204], true);
         } finally {
             if (is_resource($stream)) {
                 fclose($stream);
@@ -244,20 +218,17 @@ class NextcloudClient
         return in_array($response->getStatusCode(), [200, 201, 204], true);
     }
 
+    /**
+     * Check existence using a lightweight HEAD request instead of PROPFIND.
+     */
     public function exists(string $path): bool
     {
-        $response = $this->client->request('PROPFIND', $this->buildWebdavPath($path), [
-            'headers' => [
-                'Depth' => '0',
-                'Content-Type' => 'application/xml',
-            ],
-            'body' => '<?xml version="1.0" encoding="UTF-8"?>
-                <d:propfind xmlns:d="DAV:">
-                    <d:prop><d:resourcetype/></d:prop>
-                </d:propfind>',
+        $response = $this->client->request('HEAD', $this->buildWebdavPath($path), [
+            'timeout' => 10,
         ]);
 
-        return $response->getStatusCode() === 207;
+        // 200 = file exists, 301 = collection redirect (folder exists)
+        return in_array($response->getStatusCode(), [200, 301], true);
     }
 
     private function buildWebdavPath(string $path): string
@@ -283,33 +254,17 @@ class NextcloudClient
         $body = $response->getBody()->getContents();
         $xml = @simplexml_load_string($body);
         if ($xml === false) {
-            $this->log('error', 'Failed to parse PROPFIND XML response', [
-                'body' => substr($body, 0, 1000),
-            ]);
             return [];
         }
 
-        $namespaces = $xml->getNamespaces(true);
-
-        // Determine the DAV: namespace prefix used in the document
-        $davPrefix = '';
-        foreach ($namespaces as $prefix => $uri) {
-            if ($uri === 'DAV:') {
-                $davPrefix = $prefix;
-                break;
-            }
-        }
-
-        // Use namespace-aware children access instead of XPath
-        // as XPath with registered namespaces can be fragile across PHP versions
         $entries = [];
 
-        foreach ($xml->children('DAV:') as $response) {
-            if ($response->getName() !== 'response') {
+        foreach ($xml->children('DAV:') as $responseNode) {
+            if ($responseNode->getName() !== 'response') {
                 continue;
             }
 
-            $href = (string)$response->children('DAV:')->href;
+            $href = (string)$responseNode->children('DAV:')->href;
             if ($href === '') {
                 continue;
             }
@@ -318,7 +273,7 @@ class NextcloudClient
 
             // Find the propstat with status 200
             $foundProp = null;
-            foreach ($response->children('DAV:') as $child) {
+            foreach ($responseNode->children('DAV:') as $child) {
                 if ($child->getName() !== 'propstat') {
                     continue;
                 }
@@ -335,11 +290,9 @@ class NextcloudClient
 
             $davProps = $foundProp->children('DAV:');
 
-            // Check if resource is a collection (directory)
             $isDirectory = false;
             if (isset($davProps->resourcetype)) {
-                $resourceTypeChildren = $davProps->resourcetype->children('DAV:');
-                foreach ($resourceTypeChildren as $rtChild) {
+                foreach ($davProps->resourcetype->children('DAV:') as $rtChild) {
                     if ($rtChild->getName() === 'collection') {
                         $isDirectory = true;
                         break;
@@ -361,8 +314,6 @@ class NextcloudClient
                 'mimetype' => $contentType,
             ];
         }
-
-        $this->log('debug', 'PROPFIND parsed {count} entries', ['count' => count($entries)]);
 
         return $entries;
     }
@@ -387,10 +338,5 @@ class NextcloudClient
         }
 
         return $identifier;
-    }
-
-    private function log(string $level, string $message, array $context = []): void
-    {
-        $this->logger?->$level('[NextcloudFAL] ' . $message, $context);
     }
 }

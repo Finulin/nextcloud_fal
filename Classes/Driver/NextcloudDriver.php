@@ -29,6 +29,9 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
     /** @var array<string, string> File identifier => local temp file path */
     private array $localFileCache = [];
 
+    /** @var array<string, bool> Identifier => existence result for paths checked via exists() */
+    private array $existsCache = [];
+
     public function __construct(array $configuration = [])
     {
         parent::__construct($configuration);
@@ -148,12 +151,12 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
             return false;
         }
 
-        // Check cache first – ensure it's actually a file, not a directory
+        // Check entry cache – ensure it's actually a file, not a directory
         if (isset($this->entryCache[$fileIdentifier])) {
             return !$this->entryCache[$fileIdentifier]['is_directory'];
         }
 
-        // Load entry to distinguish file from folder
+        // Try populating from parent folder listing (1 request for all siblings)
         $entry = $this->getEntryByIdentifier($fileIdentifier);
         if ($entry === null) {
             return false;
@@ -245,7 +248,6 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
         // Return cached local copy if available (avoids re-downloading for hash etc.)
         if (isset($this->localFileCache[$fileIdentifier]) && file_exists($this->localFileCache[$fileIdentifier])) {
             if ($writable) {
-                // Writable copy needed – make a copy so the cached version stays intact
                 $copy = $this->getTemporaryPathForFile($fileIdentifier);
                 copy($this->localFileCache[$fileIdentifier], $copy);
                 return $copy;
@@ -253,9 +255,9 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
             return $this->localFileCache[$fileIdentifier];
         }
 
+        // Stream directly to disk – avoids loading entire file into memory
         $temporaryPath = $this->getTemporaryPathForFile($fileIdentifier);
-        $contents = $this->getClient()->get($fileIdentifier);
-        file_put_contents($temporaryPath, $contents);
+        $this->getClient()->downloadToFile($fileIdentifier, $temporaryPath);
 
         $this->localFileCache[$fileIdentifier] = $temporaryPath;
 
@@ -265,8 +267,9 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
     public function dumpFileContents(string $identifier): void
     {
         $identifier = $this->canonicalizeAndCheckFileIdentifier($identifier);
-        $contents = $this->getClient()->get($identifier);
-        echo $contents;
+        // Use local processing cache if available, otherwise stream
+        $localPath = $this->getFileForLocalProcessing($identifier, false);
+        readfile($localPath);
     }
 
     public function hash(string $fileIdentifier, string $hashAlgorithm): string
@@ -401,18 +404,27 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
             return false;
         }
 
-        // Check cache – ensure it's actually a directory
+        // Check entry cache – ensure it's actually a directory
         if (isset($this->entryCache[$folderIdentifier])) {
             return $this->entryCache[$folderIdentifier]['is_directory'];
         }
 
-        // Load entry to check type
-        $entry = $this->getEntryByIdentifier($folderIdentifier);
-        if ($entry === null) {
-            return false;
+        // Check exists cache (avoids repeated HEAD requests for the same path)
+        if (isset($this->existsCache[$folderIdentifier])) {
+            return $this->existsCache[$folderIdentifier];
         }
 
-        return $entry['is_directory'];
+        // Try populating from parent folder listing
+        $entry = $this->getEntryByIdentifier($folderIdentifier);
+        if ($entry !== null) {
+            return $entry['is_directory'];
+        }
+
+        // Fallback: lightweight HEAD check, cache the result
+        $result = $this->getClient()->exists($folderIdentifier);
+        $this->existsCache[$folderIdentifier] = $result;
+
+        return $result;
     }
 
     public function isFolderEmpty(string $folderIdentifier): bool
@@ -783,6 +795,11 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
         foreach ($this->entryCache as $key => $_) {
             if (str_starts_with($key, $folderIdentifier)) {
                 unset($this->entryCache[$key]);
+            }
+        }
+        foreach ($this->existsCache as $key => $_) {
+            if (str_starts_with($key, $folderIdentifier)) {
+                unset($this->existsCache[$key]);
             }
         }
     }
