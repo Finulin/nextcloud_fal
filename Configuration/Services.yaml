@@ -1,0 +1,14 @@
+services:
+  _defaults:
+    autowire: true
+    autoconfigure: true
+    public: false
+
+  Codeblick\NextcloudFal\:
+    resource: '../Classes/*'
+
+  Codeblick\NextcloudFal\Command\TestConnectionCommand:
+    tags:
+      - name: 'console.command'
+        command: 'nextcloud:test'
+        description: 'Test the NextCloud WebDAV connection'

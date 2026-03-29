@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes" ?>
+<xliff version="1.2" xmlns="urn:oasis:names:tc:xliff:document:1.2">
+    <file source-language="en" target-language="de" datatype="plaintext" original="messages" date="2026-03-29T00:00:00Z" product-name="nextcloud_fal">
+        <header/>
+        <body>
+            <trans-unit id="flexform.baseUrl" resname="flexform.baseUrl">
+                <source>NextCloud URL</source>
+                <target>NextCloud URL</target>
+            </trans-unit>
+            <trans-unit id="flexform.baseUrl.description" resname="flexform.baseUrl.description">
+                <source>Base URL of your NextCloud instance (e.g. https://cloud.example.com)</source>
+                <target>Basis-URL der NextCloud-Instanz (z.B. https://cloud.example.com)</target>
+            </trans-unit>
+            <trans-unit id="flexform.username" resname="flexform.username">
+                <source>Username</source>
+                <target>Benutzername</target>
+            </trans-unit>
+            <trans-unit id="flexform.password" resname="flexform.password">
+                <source>Password / App Token</source>
+                <target>Passwort / App-Token</target>
+            </trans-unit>
+            <trans-unit id="flexform.password.description" resname="flexform.password.description">
+                <source>Use an app-specific password generated in NextCloud settings for better security</source>
+                <target>Verwende ein App-spezifisches Passwort aus den NextCloud-Einstellungen für mehr Sicherheit</target>
+            </trans-unit>
+            <trans-unit id="flexform.caseSensitive" resname="flexform.caseSensitive">
+                <source>Case-sensitive file system</source>
+                <target>Groß-/Kleinschreibung beachten</target>
+            </trans-unit>
+        </body>
+    </file>
+</xliff>
