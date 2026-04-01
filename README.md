@@ -85,6 +85,7 @@ Der Befehl gibt HTTP-Status, WebDAV-Pfad sowie den Inhalt des Root-Verzeichnisse
 | Rekursive Verzeichnislisten | ja |
 | Sortierung und Filterung | ja |
 | Streaming-Download (speichereffizient) | ja |
+| Bildmetadaten (Breite/Höhe) automatisch extrahieren | ja |
 | Öffentliche URLs | nein |
 
 ## Architektur
@@ -92,11 +93,13 @@ Der Befehl gibt HTTP-Status, WebDAV-Pfad sowie den Inhalt des Root-Verzeichnisse
 ```
 Classes/
 ├── Client/
-│   └── NextcloudClient.php      # HTTP-Client (Guzzle), WebDAV-Methoden
+│   └── NextcloudClient.php          # HTTP-Client (Guzzle), WebDAV-Methoden
 ├── Command/
-│   └── TestConnectionCommand.php # CLI-Befehl für Verbindungstest
-└── Driver/
-    └── NextcloudDriver.php       # FAL-DriverInterface-Implementierung
+│   └── TestConnectionCommand.php    # CLI-Befehl für Verbindungstest
+├── Driver/
+│   └── NextcloudDriver.php          # FAL-DriverInterface-Implementierung
+└── Index/
+    └── NextcloudImageMetaDataExtractor.php  # Bildmetadaten-Extraktor (Breite/Höhe)
 Configuration/
 ├── FlexForms/
 │   └── NextcloudStorage.xml      # Backend-Konfigurationsformular
@@ -119,9 +122,11 @@ $GLOBALS['TYPO3_CONF_VARS']['SYS']['fal']['registeredDrivers']['NextcloudFal'] =
 ];
 ```
 
-### Internes Caching
+### Caching
 
-Der Driver hält drei In-Memory-Caches, um WebDAV-Requests zu minimieren:
+Der Driver arbeitet mit zwei Cache-Ebenen, um WebDAV-Requests zu minimieren:
+
+**In-Memory-Cache (Request-lokal)**
 
 | Cache | Zweck |
 |-------|-------|
@@ -129,7 +134,17 @@ Der Driver hält drei In-Memory-Caches, um WebDAV-Requests zu minimieren:
 | `folderListingCache` | PROPFIND-Ergebnisse je Ordner (Depth 1) |
 | `localFileCache` | Lokale Temp-Kopien für Hash-Berechnung und Verarbeitung |
 
-Ein einzelner PROPFIND-Request mit `Depth: 1` befüllt beide Caches für alle Kinder eines Ordners.
+**Persistenter Cache (request-übergreifend)**
+
+Registriert als `nextcloud_fal` (TYPO3 CachingFramework, `FileBackend`, TTL 300 s). Ordner-Listings und Einzeleinträge werden gecacht und per Cache-Tag invalidiert, wenn ein Ordner oder eine Datei geändert wird.
+
+Ein einzelner PROPFIND-Request mit `Depth: 1` befüllt beide Ebenen für alle Kinder eines Ordners gleichzeitig.
+
+### Verarbeitete Bilder (Thumbnails)
+
+Beim ersten Aufruf setzt der Driver `sys_file_storage.processingfolder` automatisch auf `1:/_processed_/`, sofern noch kein Storage-übergreifender Wert konfiguriert ist. Dadurch landen Thumbnails und skalierte Bilder im lokalen Fileadmin-Storage statt in NextCloud – was direkten URL-Zugriff ermöglicht und die Serverlast reduziert.
+
+Den Ziel-Storage kann man nachträglich im Backend unter **Dateiliste → Speicher → Ordner für temporäre Bilder** ändern.
 
 ## Entwicklung
 
