@@ -172,7 +172,14 @@ class NextcloudClient
                 'body' => $stream,
             ]);
 
-            return in_array($response->getStatusCode(), [200, 201, 204], true);
+            $status = $response->getStatusCode();
+            if (!in_array($status, [200, 201, 204], true)) {
+                throw new \RuntimeException(
+                    sprintf('Failed to upload file "%s" to Nextcloud: HTTP %d', $path, $status)
+                );
+            }
+
+            return true;
         } finally {
             if (is_resource($stream)) {
                 fclose($stream);

@@ -7,6 +7,9 @@ namespace Codeblick\NextcloudFal\Driver;
 use Codeblick\NextcloudFal\Client\NextcloudClient;
 use Psr\Log\LoggerAwareInterface;
 use Psr\Log\LoggerAwareTrait;
+use TYPO3\CMS\Core\Cache\CacheManager;
+use TYPO3\CMS\Core\Cache\Frontend\FrontendInterface;
+use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Resource\Capabilities;
 use TYPO3\CMS\Core\Resource\Driver\AbstractHierarchicalFilesystemDriver;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
@@ -19,6 +22,8 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
     private const DEFAULT_FOLDER = '_default_upload_';
 
     private ?NextcloudClient $client = null;
+
+    private ?FrontendInterface $persistentCache = null;
 
     /** @var array<string, array{path: string, is_directory: bool, size: int, mtime: int, ctime: int, mimetype: string}> */
     private array $entryCache = [];
@@ -54,6 +59,63 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
 
         if ($baseUrl !== '' && $username !== '') {
             $this->client = new NextcloudClient($baseUrl, $username, $password, $this->logger);
+        }
+
+        try {
+            $this->persistentCache = GeneralUtility::makeInstance(CacheManager::class)
+                ->getCache('nextcloud_fal');
+        } catch (\TYPO3\CMS\Core\Cache\Exception\NoSuchCacheException) {
+            // Cache not available, continue without persistent caching
+        }
+
+        $this->ensureLocalProcessingFolder();
+    }
+
+    /**
+     * Redirects processed file storage to the local default storage (UID 1) on first use.
+     * This prevents TYPO3 from storing thumbnails/resized images in Nextcloud,
+     * which would require downloading them from Nextcloud on every frontend/backend request.
+     */
+    private function ensureLocalProcessingFolder(): void
+    {
+        if ($this->storageUid <= 0) {
+            return;
+        }
+
+        try {
+            $connection = GeneralUtility::makeInstance(ConnectionPool::class)
+                ->getConnectionForTable('sys_file_storage');
+
+            $record = $connection
+                ->select(['processingfolder'], 'sys_file_storage', ['uid' => $this->storageUid])
+                ->fetchAssociative();
+
+            if ($record === false) {
+                return;
+            }
+
+            $processingFolder = $record['processingfolder'] ?? '';
+
+            // Already redirected to a different storage (format "storageUid:path")
+            if (str_contains($processingFolder, ':')) {
+                return;
+            }
+
+            // Set processing folder to local default storage so processed images
+            // are stored locally and served via direct URLs (not via Nextcloud WebDAV)
+            $connection->update(
+                'sys_file_storage',
+                ['processingfolder' => '1:/_processed_/'],
+                ['uid' => $this->storageUid]
+            );
+
+            // Remove any existing processed file records pointing to this Nextcloud storage
+            // so TYPO3 regenerates them in the correct local location
+            GeneralUtility::makeInstance(ConnectionPool::class)
+                ->getConnectionForTable('sys_file_processedfile')
+                ->delete('sys_file_processedfile', ['storage' => $this->storageUid]);
+        } catch (\Throwable) {
+            // Non-critical: if this fails the storage still works, just with slower processing
         }
     }
 
@@ -126,13 +188,12 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
 
         // Cache local file for subsequent hash/indexing calls to avoid re-download
         if ($removeOriginal) {
-            // Move instead of delete so we can reuse it for hashing
+            // Copy to TYPO3 transient dir (rename fails cross-filesystem on macOS)
             $tempCopy = $this->getTemporaryPathForFile($identifier);
-            if (rename($localFilePath, $tempCopy)) {
+            if (copy($localFilePath, $tempCopy)) {
                 $this->localFileCache[$identifier] = $tempCopy;
-            } elseif (file_exists($localFilePath)) {
-                unlink($localFilePath);
             }
+            @unlink($localFilePath);
         } else {
             // Keep a reference to the original for hashing
             $tempCopy = $this->getTemporaryPathForFile($identifier);
@@ -420,9 +481,21 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
             return $entry['is_directory'];
         }
 
+        // Try persistent cache for existence check
+        $cacheKey = $this->buildCacheKey('exists', $folderIdentifier);
+        $cached = $this->persistentCache?->get($cacheKey);
+        if ($cached !== false && $cached !== null) {
+            $this->existsCache[$folderIdentifier] = $cached;
+            return $cached;
+        }
+
         // Fallback: lightweight HEAD check, cache the result
         $result = $this->getClient()->exists($folderIdentifier);
         $this->existsCache[$folderIdentifier] = $result;
+
+        $parentFolder = $this->getParentFolderIdentifierOfIdentifier($folderIdentifier);
+        $folderTag = $this->buildCacheTag($parentFolder);
+        $this->persistentCache?->set($cacheKey, $result, [$folderTag]);
 
         return $result;
     }
@@ -443,7 +516,7 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
         // WebDAV DELETE on a collection always deletes recursively
         $result = $this->getClient()->delete($folderIdentifier);
         $this->flushCacheForFolder($parentFolder);
-        unset($this->folderListingCache[$folderIdentifier]);
+        $this->flushCacheForFolder($folderIdentifier);
 
         return $result;
     }
@@ -625,20 +698,40 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
             return;
         }
 
+        // Try persistent cache
+        $cacheKey = $this->buildCacheKey('listing', $folderIdentifier);
+        $cached = $this->persistentCache?->get($cacheKey);
+        if ($cached !== false && $cached !== null) {
+            $this->folderListingCache[$folderIdentifier] = $cached['children'];
+            foreach ($cached['entries'] as $path => $entry) {
+                $this->entryCache[$path] = $entry;
+            }
+            return;
+        }
+
+        // Fetch from Nextcloud
         $entries = $this->getClient()->propfind($folderIdentifier, 1);
         $children = [];
+        $allEntries = [];
 
         foreach ($entries as $entry) {
             $path = $entry['path'];
             $this->entryCache[$path] = $entry;
+            $allEntries[$path] = $entry;
 
-            // Skip the folder itself
             if ($path !== $folderIdentifier) {
                 $children[$path] = $entry;
             }
         }
 
         $this->folderListingCache[$folderIdentifier] = $children;
+
+        // Store in persistent cache with folder tag for targeted invalidation
+        $folderTag = $this->buildCacheTag($folderIdentifier);
+        $this->persistentCache?->set($cacheKey, [
+            'children' => $children,
+            'entries' => $allEntries,
+        ], [$folderTag]);
     }
 
     private function getEntryByIdentifier(string $identifier): ?array
@@ -655,6 +748,14 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
             return $this->entryCache[$identifier];
         }
 
+        // Try persistent cache for single entry
+        $cacheKey = $this->buildCacheKey('entry', $identifier);
+        $cached = $this->persistentCache?->get($cacheKey);
+        if ($cached !== false && $cached !== null) {
+            $this->entryCache[$identifier] = $cached;
+            return $cached;
+        }
+
         // Fallback: direct PROPFIND for this single entry
         $entries = $this->getClient()->propfind($identifier, 0);
         if (empty($entries)) {
@@ -663,6 +764,10 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
 
         $entry = $entries[0];
         $this->entryCache[$identifier] = $entry;
+
+        // Persist with parent folder tag
+        $folderTag = $this->buildCacheTag($parentFolder);
+        $this->persistentCache?->set($cacheKey, $entry, [$folderTag]);
 
         return $entry;
     }
@@ -802,6 +907,10 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
                 unset($this->existsCache[$key]);
             }
         }
+
+        // Flush persistent cache: listing + all tagged entries for this folder
+        $this->persistentCache?->remove($this->buildCacheKey('listing', $folderIdentifier));
+        $this->persistentCache?->flushByTag($this->buildCacheTag($folderIdentifier));
     }
 
     /**
@@ -812,5 +921,19 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
         unset($this->entryCache[$identifier]);
         $parentFolder = $this->getParentFolderIdentifierOfIdentifier($identifier);
         unset($this->folderListingCache[$parentFolder]);
+
+        // Flush persistent cache
+        $this->persistentCache?->remove($this->buildCacheKey('entry', $identifier));
+        $this->persistentCache?->remove($this->buildCacheKey('listing', $parentFolder));
+    }
+
+    private function buildCacheKey(string $prefix, string $identifier): string
+    {
+        return 'storage_' . $this->storageUid . '_' . $prefix . '_' . sha1($identifier);
+    }
+
+    private function buildCacheTag(string $folderIdentifier): string
+    {
+        return 'storage_' . $this->storageUid . '_folder_' . sha1($folderIdentifier);
     }
 }
