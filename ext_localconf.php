@@ -22,7 +22,7 @@ $GLOBALS['TYPO3_CONF_VARS']['SYS']['caching']['cacheConfigurations']['nextcloud_
     'frontend' => VariableFrontend::class,
     'backend' => FileBackend::class,
     'options' => [
-        'defaultLifetime' => 300,
+        'defaultLifetime' => 1800,
     ],
     'groups' => ['system'],
 ];

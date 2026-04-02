@@ -382,11 +382,8 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
 
         // Try to populate cache from folder listing
         $this->ensureFolderListingCached($folderIdentifier);
-        if (isset($this->entryCache[$identifier])) {
-            return true;
-        }
 
-        return $this->getClient()->exists($identifier);
+        return isset($this->entryCache[$identifier]);
     }
 
     public function getFileInFolder(string $fileName, string $folderIdentifier): string
@@ -736,19 +733,12 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
 
     private function getEntryByIdentifier(string $identifier): ?array
     {
+        // 1. In-memory cache
         if (isset($this->entryCache[$identifier])) {
             return $this->entryCache[$identifier];
         }
 
-        // Try populating from parent folder listing – avoids a per-file PROPFIND
-        $parentFolder = $this->getParentFolderIdentifierOfIdentifier($identifier);
-        $this->ensureFolderListingCached($parentFolder);
-
-        if (isset($this->entryCache[$identifier])) {
-            return $this->entryCache[$identifier];
-        }
-
-        // Try persistent cache for single entry
+        // 2. Persistent cache for single entry
         $cacheKey = $this->buildCacheKey('entry', $identifier);
         $cached = $this->persistentCache?->get($cacheKey);
         if ($cached !== false && $cached !== null) {
@@ -756,20 +746,25 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
             return $cached;
         }
 
-        // Fallback: direct PROPFIND for this single entry
+        // 3. Direct PROPFIND Depth 0 – only fetches this single entry, no parent needed
         $entries = $this->getClient()->propfind($identifier, 0);
-        if (empty($entries)) {
-            return null;
+        if (!empty($entries)) {
+            $entry = $entries[0];
+            $this->entryCache[$identifier] = $entry;
+
+            $parentFolder = $this->getParentFolderIdentifierOfIdentifier($identifier);
+            $folderTag = $this->buildCacheTag($parentFolder);
+            $this->persistentCache?->set($cacheKey, $entry, [$folderTag]);
+
+            return $entry;
         }
 
-        $entry = $entries[0];
-        $this->entryCache[$identifier] = $entry;
+        // 4. Fallback: populate via parent folder listing (Depth 1) – catches cases where
+        //    Depth 0 on a non-existing path returns empty but parent listing reveals the entry
+        $parentFolder = $this->getParentFolderIdentifierOfIdentifier($identifier);
+        $this->ensureFolderListingCached($parentFolder);
 
-        // Persist with parent folder tag
-        $folderTag = $this->buildCacheTag($parentFolder);
-        $this->persistentCache?->set($cacheKey, $entry, [$folderTag]);
-
-        return $entry;
+        return $this->entryCache[$identifier] ?? null;
     }
 
     /**
@@ -911,6 +906,13 @@ class NextcloudDriver extends AbstractHierarchicalFilesystemDriver implements Lo
         // Flush persistent cache: listing + all tagged entries for this folder
         $this->persistentCache?->remove($this->buildCacheKey('listing', $folderIdentifier));
         $this->persistentCache?->flushByTag($this->buildCacheTag($folderIdentifier));
+
+        // Also invalidate the parent folder listing so it reflects the change
+        $parent = $this->getParentFolderIdentifierOfIdentifier(rtrim($folderIdentifier, '/') . '/');
+        if ($parent !== $folderIdentifier) {
+            unset($this->folderListingCache[$parent]);
+            $this->persistentCache?->remove($this->buildCacheKey('listing', $parent));
+        }
     }
 
     /**

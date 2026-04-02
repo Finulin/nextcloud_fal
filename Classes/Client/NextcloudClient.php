@@ -43,7 +43,9 @@ class NextcloudClient
             'auth' => [$this->username, $this->password],
             'headers' => [
                 'OCS-APIREQUEST' => 'true',
+                'Accept-Encoding' => 'gzip, deflate',
             ],
+            'decode_content' => true,
             'http_errors' => false,
             'timeout' => 300,
             'connect_timeout' => 10,
@@ -106,7 +108,7 @@ class NextcloudClient
                 'Content-Type' => 'application/xml',
             ],
             'body' => '<?xml version="1.0" encoding="UTF-8"?>
-                <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
+                <d:propfind xmlns:d="DAV:">
                     <d:prop>
                         <d:resourcetype/>
                         <d:getcontentlength/>
@@ -114,7 +116,6 @@ class NextcloudClient
                         <d:creationdate/>
                         <d:getcontenttype/>
                         <d:getetag/>
-                        <oc:permissions/>
                     </d:prop>
                 </d:propfind>',
         ]);
